@@ -2634,6 +2634,47 @@ static int _wants_firmware_data(plist_t arguments)
 	return result;
 }
 
+static plist_t request_get_prefixed_tag(plist_t request, const char* tag_name)
+{
+	if (!request || plist_get_node_type(request) != PLIST_DICT) return NULL;
+	plist_dict_iter iter = NULL;
+	plist_dict_new_iter(request, &iter);
+	char* key = NULL;
+	plist_t val = NULL;
+	plist_t result = NULL;
+	do {
+		plist_dict_next_item(request, iter, &key, &val);
+		if (key && val) {
+			const char* p = strrchr(key, ',');
+			if (p && strcmp(p + 1, tag_name) == 0) {
+				result = val;
+				break;
+			}
+		}
+	} while (val);
+	free(iter);
+	return result;
+}
+
+static plist_t plist_new_uint_from_node(plist_t node)
+{
+	uint64_t val = 0;
+	if (!node) return NULL;
+	if (plist_get_node_type(node) == PLIST_UINT) {
+		plist_get_uint_val(node, &val);
+	} else if (plist_get_node_type(node) == PLIST_STRING) {
+		char* s = NULL;
+		plist_get_string_val(node, &s);
+		if (s) {
+			val = strtoull(s, NULL, 0);
+			free(s);
+		}
+	} else {
+		return plist_copy(node);
+	}
+	return plist_new_uint(val);
+}
+
 static void tss_request_add_caveman_tags(struct idevicerestore_client_t* client, plist_t request, plist_t p_info, plist_t build_identity, const char* prefix, uint64_t ecid, unsigned char* nonce, int nonce_size)
 {
 	/* 1. Add AP tags from build_identity and client info */
@@ -2642,13 +2683,17 @@ static void tss_request_add_caveman_tags(struct idevicerestore_client_t* client,
 	plist_dict_set_item(request, "ApSupportsImg4", plist_new_bool(1));
 	plist_dict_set_item(request, "ApECID", plist_new_uint(ecid));
 	plist_dict_set_item(request, "ApSecurityDomain", plist_new_uint(1));
+	plist_dict_set_item(request, "Ap,SikaFuse", plist_new_bool(1));
+	plist_dict_set_item(request, "UID_MODE", plist_new_bool(0));
+	plist_dict_set_item(request, "Ap,LocalBoot", plist_new_bool(0));
+	plist_dict_set_item(request, "Ap,EPROOM", plist_new_bool(0));
 	plist_t node = plist_dict_get_item(build_identity, "ApChipID");
 	if (node) {
-		plist_dict_set_item(request, "ApChipID", plist_copy(node));
+		plist_dict_set_item(request, "ApChipID", plist_new_uint_from_node(node));
 	}
 	node = plist_dict_get_item(build_identity, "ApBoardID");
 	if (node) {
-		plist_dict_set_item(request, "ApBoardID", plist_copy(node));
+		plist_dict_set_item(request, "ApBoardID", plist_new_uint_from_node(node));
 	}
 	if (nonce && nonce_size > 0) {
 		plist_dict_set_item(request, "ApNonce", plist_new_data((char*)nonce, nonce_size));
@@ -2671,7 +2716,10 @@ static void tss_request_add_caveman_tags(struct idevicerestore_client_t* client,
 		}
 		if (client->parameters) {
 			plist_t node_sn = plist_dict_get_item(client->parameters, "ApSepNonce");
-			if (node_sn) plist_dict_set_item(request, "ApSepNonce", plist_copy(node_sn));
+			if (node_sn) {
+				plist_dict_set_item(request, "ApSepNonce", plist_copy(node_sn));
+				plist_dict_set_item(request, "Ap,SepNonce", plist_copy(node_sn));
+			}
 		}
 	}
 
@@ -2723,6 +2771,11 @@ static void tss_request_add_caveman_tags(struct idevicerestore_client_t* client,
 								plist_dict_set_item(request, key, plist_copy(val));
 							}
 						}
+						/* Also add to top level if it's a known raw tag */
+						if (strcmp(tag, "BMUID") == 0 || strcmp(tag, "ActiveBMUs") == 0 ||
+						    strcmp(tag, "HWVersion") == 0 || strcmp(tag, "ChemistryID") == 0) {
+							plist_dict_set_item(request, tag, plist_copy(val));
+						}
 					}
 				}
 			} while (val);
@@ -2733,18 +2786,28 @@ static void tss_request_add_caveman_tags(struct idevicerestore_client_t* client,
 		/* ChipID */
 		snprintf(key, sizeof(key), "%s,ChipID", prefix);
 		if (!plist_dict_get_item(request, key)) {
-			info_node = plist_dict_get_item(build_identity, "ApChipID");
+			info_node = request_get_prefixed_tag(request, "ChipID");
 			if (info_node) {
 				plist_dict_set_item(request, key, plist_copy(info_node));
+			} else {
+				info_node = plist_dict_get_item(build_identity, "ApChipID");
+				if (info_node) {
+					plist_dict_set_item(request, key, plist_new_uint_from_node(info_node));
+				}
 			}
 		}
 
 		/* BoardID */
 		snprintf(key, sizeof(key), "%s,BoardID", prefix);
 		if (!plist_dict_get_item(request, key)) {
-			info_node = plist_dict_get_item(build_identity, "ApBoardID");
+			info_node = request_get_prefixed_tag(request, "BoardID");
 			if (info_node) {
 				plist_dict_set_item(request, key, plist_copy(info_node));
+			} else {
+				info_node = plist_dict_get_item(build_identity, "ApBoardID");
+				if (info_node) {
+					plist_dict_set_item(request, key, plist_new_uint_from_node(info_node));
+				}
 			}
 		}
 

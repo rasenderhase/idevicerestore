@@ -2423,17 +2423,24 @@ int get_tss_response(struct idevicerestore_client_t* client, plist_t build_ident
 		plist_dict_set_item(parameters, "ApNonce", plist_new_data((const char*)client->nonce, client->nonce_size));
 	}
 
-	if (!plist_dict_get_item(parameters, "SepNonce")) {
+	if (!plist_dict_get_item(parameters, "ApSepNonce")) {
 		unsigned char* sep_nonce = NULL;
 		unsigned int sep_nonce_size = 0;
 		get_sep_nonce(client, &sep_nonce, &sep_nonce_size);
 		if (sep_nonce) {
-			plist_dict_set_item(parameters, "ApSepNonce", plist_new_data((const char*)sep_nonce, sep_nonce_size));
+			plist_t n_sep_nonce = plist_new_data((const char*)sep_nonce, sep_nonce_size);
+			plist_dict_set_item(parameters, "ApSepNonce", plist_copy(n_sep_nonce));
+			if (!client->parameters) {
+				client->parameters = plist_new_dict();
+			}
+			plist_dict_set_item(client->parameters, "ApSepNonce", n_sep_nonce);
 			free(sep_nonce);
 		}
 	}
 
 	plist_dict_set_item(parameters, "ApProductionMode", plist_new_bool(1));
+	plist_dict_set_item(parameters, "Ap,SikaFuse", plist_new_bool(1));
+	plist_dict_set_item(parameters, "UID_MODE", plist_new_bool(0));
 	if (client->image4supported) {
 		plist_dict_set_item(parameters, "ApSecurityMode", plist_new_bool(1));
 		plist_dict_set_item(parameters, "ApSupportsImg4", plist_new_bool(1));
@@ -2566,6 +2573,8 @@ int get_recoveryos_root_ticket_tss_response(struct idevicerestore_client_t* clie
 
 	/* ApProductionMode */
 	plist_dict_set_item(parameters, "ApProductionMode", plist_new_bool(1));
+	plist_dict_set_item(parameters, "Ap,SikaFuse", plist_new_bool(1));
+	plist_dict_set_item(parameters, "UID_MODE", plist_new_bool(0));
 
 	/* ApSecurityMode */
 	if (client->image4supported) {
@@ -2648,6 +2657,8 @@ int get_recovery_os_local_policy_tss_response(
 	plist_dict_set_item(parameters, "Ap,LocalBoot", plist_new_bool(1));
 
 	plist_dict_set_item(parameters, "ApProductionMode", plist_new_bool(1));
+	plist_dict_set_item(parameters, "Ap,SikaFuse", plist_new_bool(1));
+	plist_dict_set_item(parameters, "UID_MODE", plist_new_bool(0));
 	if (client->image4supported) {
 		plist_dict_set_item(parameters, "ApSecurityMode", plist_new_bool(1));
 		plist_dict_set_item(parameters, "ApSupportsImg4", plist_new_bool(1));
@@ -2743,6 +2754,8 @@ int get_local_policy_tss_response(struct idevicerestore_client_t* client, plist_
 	}
 
 	plist_dict_set_item(parameters, "ApProductionMode", plist_new_bool(1));
+	plist_dict_set_item(parameters, "Ap,SikaFuse", plist_new_bool(1));
+	plist_dict_set_item(parameters, "UID_MODE", plist_new_bool(0));
 	if (client->image4supported) {
 		plist_dict_set_item(parameters, "ApSecurityMode", plist_new_bool(1));
 		plist_dict_set_item(parameters, "ApSupportsImg4", plist_new_bool(1));
