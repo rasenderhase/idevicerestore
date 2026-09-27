@@ -118,6 +118,8 @@
 #define REQUESTING_EAN_DATA           74
 #define SEALING_SYSTEM_VOLUME         77
 #define UPDATING_APPLETCON            81
+#define UPDATING_CRYPTEX1             88
+#define UPDATING_SAVAGE_EAN           80
 
 static int restore_finished = 0;
 
@@ -632,6 +634,10 @@ const char* restore_progress_string(unsigned int operation)
 		return "Sealing System Volume";
 	case UPDATING_APPLETCON:
 		return "Updating AppleTCON";
+	case UPDATING_CRYPTEX1:
+		return "Updating Cryptex1";
+	case UPDATING_SAVAGE_EAN:
+		return "Updating Savage EAN";
 	default:
 		return "Unknown operation";
 	}
@@ -2628,6 +2634,162 @@ static int _wants_firmware_data(plist_t arguments)
 	return result;
 }
 
+static void tss_request_add_caveman_tags(struct idevicerestore_client_t* client, plist_t request, plist_t p_info, plist_t build_identity, const char* prefix, uint64_t ecid, unsigned char* nonce, int nonce_size)
+{
+	/* 1. Add AP tags from build_identity and client info */
+	plist_dict_set_item(request, "ApProductionMode", plist_new_bool(1));
+	plist_dict_set_item(request, "ApSecurityMode", plist_new_bool(1));
+	plist_dict_set_item(request, "ApSupportsImg4", plist_new_bool(1));
+	plist_dict_set_item(request, "ApECID", plist_new_uint(ecid));
+	plist_dict_set_item(request, "ApSecurityDomain", plist_new_uint(1));
+	plist_t node = plist_dict_get_item(build_identity, "ApChipID");
+	if (node) {
+		plist_dict_set_item(request, "ApChipID", plist_copy(node));
+	}
+	node = plist_dict_get_item(build_identity, "ApBoardID");
+	if (node) {
+		plist_dict_set_item(request, "ApBoardID", plist_copy(node));
+	}
+	if (nonce && nonce_size > 0) {
+		plist_dict_set_item(request, "ApNonce", plist_new_data((char*)nonce, nonce_size));
+		plist_dict_set_item(request, "Ap,Nonce", plist_new_data((char*)nonce, nonce_size));
+	}
+
+	/* Copy AP tickets and other tags from client info if available */
+	if (client) {
+		if (client->tss) {
+			plist_t ticket = plist_dict_get_item(client->tss, "Ap,SepTicket");
+			if (ticket) plist_dict_set_item(request, "Ap,SepTicket", plist_copy(ticket));
+			ticket = plist_dict_get_item(client->tss, "Ap,Cryptex1Ticket");
+			if (ticket) plist_dict_set_item(request, "Ap,Cryptex1Ticket", plist_copy(ticket));
+			ticket = plist_dict_get_item(client->tss, "Ap,OSUpdatePreflight");
+			if (ticket) plist_dict_set_item(request, "Ap,OSUpdatePreflight", plist_copy(ticket));
+			ticket = plist_dict_get_item(client->tss, "Ap,Ticket");
+			if (ticket) plist_dict_set_item(request, "Ap,Ticket", plist_copy(ticket));
+			if (ticket && !plist_dict_get_item(request, "ApTicket"))
+				plist_dict_set_item(request, "ApTicket", plist_copy(ticket));
+		}
+		if (client->parameters) {
+			plist_t node_sn = plist_dict_get_item(client->parameters, "ApSepNonce");
+			if (node_sn) plist_dict_set_item(request, "ApSepNonce", plist_copy(node_sn));
+		}
+	}
+
+	/* 2. Add component tags, preferring p_info (hardware values) over AP values */
+	if (prefix) {
+		char key[128];
+		plist_t info_node = NULL;
+
+		/* Iterate over p_info and add all tags with prefix */
+		if (p_info && plist_get_node_type(p_info) == PLIST_DICT) {
+			plist_dict_iter iter = NULL;
+			plist_dict_new_iter(p_info, &iter);
+			char* tag = NULL;
+			plist_t val = NULL;
+			do {
+				plist_dict_next_item(p_info, iter, &tag, &val);
+				if (tag && val) {
+					/* Skip tags that are already prefixed or are special */
+					if (strstr(tag, prefix) == tag) {
+						plist_dict_set_item(request, tag, plist_copy(val));
+					} else if (strcmp(tag, "UpdaterOptions") == 0) {
+						/* Propagate context from UpdaterOptions */
+						plist_t opt_val = plist_dict_get_item(val, "APTicket");
+						if (opt_val) {
+							if (!plist_dict_get_item(request, "Ap,Ticket"))
+								plist_dict_set_item(request, "Ap,Ticket", plist_copy(opt_val));
+							if (!plist_dict_get_item(request, "ApTicket"))
+								plist_dict_set_item(request, "ApTicket", plist_copy(opt_val));
+							if (!plist_dict_get_item(request, "Ap,SepTicket"))
+								plist_dict_set_item(request, "Ap,SepTicket", plist_copy(opt_val));
+						}
+						opt_val = plist_dict_get_item(val, "SepTicket");
+						if (opt_val && !plist_dict_get_item(request, "Ap,SepTicket"))
+							plist_dict_set_item(request, "Ap,SepTicket", plist_copy(opt_val));
+						opt_val = plist_dict_get_item(val, "Cryptex1Ticket");
+						if (opt_val && !plist_dict_get_item(request, "Ap,Cryptex1Ticket"))
+							plist_dict_set_item(request, "Ap,Cryptex1Ticket", plist_copy(opt_val));
+						opt_val = plist_dict_get_item(val, "PreflightContext");
+						if (opt_val && !plist_dict_get_item(request, "PreflightContext"))
+							plist_dict_set_item(request, "PreflightContext", plist_copy(opt_val));
+					} else if (strcmp(tag, "DeviceGeneratedRequest") != 0) {
+						snprintf(key, sizeof(key), "%s,%s", prefix, tag);
+						/* Always overwrite with hardware values as they are more accurate */
+						plist_dict_set_item(request, key, plist_copy(val));
+						/* If we have UniqueID but no ECID, use UniqueID for ECID too */
+						if (strcmp(tag, "UniqueID") == 0) {
+							snprintf(key, sizeof(key), "%s,ECID", prefix);
+							if (!plist_dict_get_item(p_info, "ECID")) {
+								plist_dict_set_item(request, key, plist_copy(val));
+							}
+						}
+					}
+				}
+			} while (val);
+			free(iter);
+		}
+
+		/* Ensure common tags are present even if not in p_info */
+		/* ChipID */
+		snprintf(key, sizeof(key), "%s,ChipID", prefix);
+		if (!plist_dict_get_item(request, key)) {
+			info_node = plist_dict_get_item(build_identity, "ApChipID");
+			if (info_node) {
+				plist_dict_set_item(request, key, plist_copy(info_node));
+			}
+		}
+
+		/* BoardID */
+		snprintf(key, sizeof(key), "%s,BoardID", prefix);
+		if (!plist_dict_get_item(request, key)) {
+			info_node = plist_dict_get_item(build_identity, "ApBoardID");
+			if (info_node) {
+				plist_dict_set_item(request, key, plist_copy(info_node));
+			}
+		}
+
+		/* ECID / UniqueID */
+		snprintf(key, sizeof(key), "%s,ECID", prefix);
+		if (!plist_dict_get_item(request, key)) {
+			plist_dict_set_item(request, key, plist_new_uint(ecid));
+		}
+		/* Also add as UniqueID for newer chips */
+		snprintf(key, sizeof(key), "%s,UniqueID", prefix);
+		if (!plist_dict_get_item(request, key)) {
+			char key2[128];
+			snprintf(key2, sizeof(key2), "%s,ECID", prefix);
+			plist_t ecid_node = plist_dict_get_item(request, key2);
+			if (ecid_node) {
+				plist_dict_set_item(request, key, plist_copy(ecid_node));
+			}
+		}
+
+		/* Nonce */
+		snprintf(key, sizeof(key), "%s,Nonce", prefix);
+		if (!plist_dict_get_item(request, key) && nonce && nonce_size > 0) {
+			plist_dict_set_item(request, key, plist_new_data((char*)nonce, nonce_size));
+		}
+
+		/* ProductionMode */
+		snprintf(key, sizeof(key), "%s,ProductionMode", prefix);
+		if (!plist_dict_get_item(request, key)) {
+			plist_dict_set_item(request, key, plist_new_bool(1));
+		}
+
+		/* SecurityMode */
+		snprintf(key, sizeof(key), "%s,SecurityMode", prefix);
+		if (!plist_dict_get_item(request, key)) {
+			plist_dict_set_item(request, key, plist_new_bool(1));
+		}
+
+		/* SupportsImg4 */
+		snprintf(key, sizeof(key), "%s,SupportsImg4", prefix);
+		if (!plist_dict_get_item(request, key)) {
+			plist_dict_set_item(request, key, plist_new_bool(1));
+		}
+	}
+}
+
 static plist_t restore_get_se_firmware_data(struct idevicerestore_client_t* client, plist_t p_info, plist_t arguments)
 {
 	const char *comp_name = NULL;
@@ -2688,11 +2850,37 @@ static plist_t restore_get_se_firmware_data(struct idevicerestore_client_t* clie
 	/* add manifest for current build_identity to parameters */
 	tss_parameters_add_from_manifest(parameters, client->restore->build_identity, true);
 
+	plist_dict_set_item(parameters, "ApProductionMode", plist_new_bool(1));
+	if (client->image4supported) {
+		plist_dict_set_item(parameters, "ApSecurityMode", plist_new_bool(1));
+		plist_dict_set_item(parameters, "ApSupportsImg4", plist_new_bool(1));
+	} else {
+		plist_dict_set_item(parameters, "ApSupportsImg4", plist_new_bool(0));
+	}
+
+	plist_dict_set_item(parameters, "ApECID", plist_new_uint(client->ecid));
+	plist_dict_set_item(parameters, "ApSecurityDomain", plist_new_uint(1));
+
+	node = plist_dict_get_item(client->restore->build_identity, "ApChipID");
+	if (node) {
+		plist_dict_set_item(parameters, "ApChipID", plist_copy(node));
+	}
+	node = plist_dict_get_item(client->restore->build_identity, "ApBoardID");
+	if (node) {
+		plist_dict_set_item(parameters, "ApBoardID", plist_copy(node));
+	}
+	if (client->nonce && client->nonce_size > 0) {
+		plist_dict_set_item(parameters, "ApNonce", plist_new_data((char*)client->nonce, client->nonce_size));
+	}
+
 	/* add SE,* tags from info dictionary to parameters */
 	plist_dict_merge(&parameters, p_info);
 
 	/* add required tags for SE TSS request */
 	tss_request_add_se_tags(request, parameters, p_dgr);
+
+	/* Caveman make sure SE request has all tags! Apple very picky! */
+	tss_request_add_caveman_tags(client, request, p_info, client->restore->build_identity, "SE", client->ecid, client->nonce, client->nonce_size);
 
 	plist_free(parameters);
 
@@ -2777,11 +2965,42 @@ static plist_t restore_get_savage_firmware_data(struct idevicerestore_client_t* 
 	/* add manifest for current build_identity to parameters */
 	tss_parameters_add_from_manifest(parameters, client->restore->build_identity, true);
 
+	plist_dict_set_item(parameters, "ApProductionMode", plist_new_bool(1));
+	if (client->image4supported) {
+		plist_dict_set_item(parameters, "ApSecurityMode", plist_new_bool(1));
+		plist_dict_set_item(parameters, "ApSupportsImg4", plist_new_bool(1));
+	} else {
+		plist_dict_set_item(parameters, "ApSupportsImg4", plist_new_bool(0));
+	}
+
+	plist_dict_set_item(parameters, "ApECID", plist_new_uint(client->ecid));
+	plist_dict_set_item(parameters, "ApSecurityDomain", plist_new_uint(1));
+
+	plist_t node = plist_dict_get_item(client->restore->build_identity, "ApChipID");
+	if (node) {
+		plist_dict_set_item(parameters, "ApChipID", plist_copy(node));
+	}
+	node = plist_dict_get_item(client->restore->build_identity, "ApBoardID");
+	if (node) {
+		plist_dict_set_item(parameters, "ApBoardID", plist_copy(node));
+	}
+	if (client->nonce && client->nonce_size > 0) {
+		plist_dict_set_item(parameters, "ApNonce", plist_new_data((char*)client->nonce, client->nonce_size));
+	}
+
 	/* add Savage,* tags from info dictionary to parameters */
 	plist_dict_merge(&parameters, p_info);
 
 	/* add required tags for Savage TSS request */
 	tss_request_add_savage_tags(request, parameters, device_generated_request, &comp_name);
+
+	if (device_generated_request) {
+		logger(LL_DEBUG, "Merging DeviceGeneratedRequest into Savage TSS request\n");
+		plist_dict_merge(&request, device_generated_request);
+	}
+
+	/* Caveman make sure Savage request has all tags! Apple very picky! */
+	tss_request_add_caveman_tags(client, request, p_info, client->restore->build_identity, "Savage", client->ecid, client->nonce, client->nonce_size);
 
 	plist_free(parameters);
 
@@ -2887,11 +3106,47 @@ static plist_t restore_get_yonkers_firmware_data(struct idevicerestore_client_t*
 	/* add manifest for current build_identity to parameters */
 	tss_parameters_add_from_manifest(parameters, client->restore->build_identity, true);
 
+	plist_dict_set_item(parameters, "ApProductionMode", plist_new_bool(1));
+	if (client->image4supported) {
+		plist_dict_set_item(parameters, "ApSecurityMode", plist_new_bool(1));
+		plist_dict_set_item(parameters, "ApSupportsImg4", plist_new_bool(1));
+	} else {
+		plist_dict_set_item(parameters, "ApSupportsImg4", plist_new_bool(0));
+	}
+
+	plist_dict_set_item(parameters, "ApECID", plist_new_uint(client->ecid));
+	plist_dict_set_item(parameters, "ApSecurityDomain", plist_new_uint(1));
+
+	plist_t node = plist_dict_get_item(client->restore->build_identity, "ApChipID");
+	if (node) {
+		plist_dict_set_item(parameters, "ApChipID", plist_copy(node));
+	}
+	node = plist_dict_get_item(client->restore->build_identity, "ApBoardID");
+	if (node) {
+		plist_dict_set_item(parameters, "ApBoardID", plist_copy(node));
+	}
+	if (client->nonce && client->nonce_size > 0) {
+		plist_dict_set_item(parameters, "ApNonce", plist_new_data((char*)client->nonce, client->nonce_size));
+	}
+
 	/* add Yonkers,* tags from info dictionary to parameters */
 	plist_dict_merge(&parameters, p_info);
 
 	/* add required tags for Yonkers TSS request */
 	tss_request_add_yonkers_tags(request, parameters, device_generated_request, &comp_name);
+
+	if (device_generated_request) {
+		logger(LL_DEBUG, "Merging DeviceGeneratedRequest into Yonkers TSS request\n");
+		plist_dict_merge(&request, device_generated_request);
+	}
+
+	/* Caveman make sure Yonkers request has all tags! Apple very picky! */
+	tss_request_add_caveman_tags(client, request, p_info, client->restore->build_identity, "Yonkers", client->ecid, client->nonce, client->nonce_size);
+
+	plist_t node_pe = plist_dict_get_item(parameters, "PatchEpoch");
+	if (node_pe) {
+		plist_dict_set_item(request, "Yonkers,PatchEpoch", plist_copy(node_pe));
+	}
 
 	plist_free(parameters);
 
@@ -2994,6 +3249,21 @@ static plist_t restore_get_rose_firmware_data(struct idevicerestore_client_t* cl
 		plist_dict_set_item(parameters, "ApSupportsImg4", plist_new_bool(0));
 	}
 
+	plist_dict_set_item(parameters, "ApECID", plist_new_uint(client->ecid));
+	plist_dict_set_item(parameters, "ApSecurityDomain", plist_new_uint(1));
+
+	plist_t node = plist_dict_get_item(client->restore->build_identity, "ApChipID");
+	if (node) {
+		plist_dict_set_item(parameters, "ApChipID", plist_copy(node));
+	}
+	node = plist_dict_get_item(client->restore->build_identity, "ApBoardID");
+	if (node) {
+		plist_dict_set_item(parameters, "ApBoardID", plist_copy(node));
+	}
+	if (client->nonce && client->nonce_size > 0) {
+		plist_dict_set_item(parameters, "ApNonce", plist_new_data((char*)client->nonce, client->nonce_size));
+	}
+
 	plist_t device_generated_request = plist_dict_get_item(arguments, "DeviceGeneratedRequest");
 	if (device_generated_request) {
 		/* use DeviceGeneratedRequest if present */
@@ -3005,6 +3275,16 @@ static plist_t restore_get_rose_firmware_data(struct idevicerestore_client_t* cl
 
 	/* add required tags for Rose TSS request */
 	tss_request_add_rose_tags(request, parameters, NULL);
+
+	/* Caveman make sure Rose request has all tags! Apple very picky! */
+	tss_request_add_caveman_tags(client, request, p_info, client->restore->build_identity, "Rap", client->ecid, client->nonce, client->nonce_size);
+	tss_request_add_caveman_tags(client, request, p_info, client->restore->build_identity, "Rose", client->ecid, client->nonce, client->nonce_size);
+
+	node = plist_dict_get_item(parameters, "PatchEpoch");
+	if (node) {
+		plist_dict_set_item(request, "Rap,PatchEpoch", plist_copy(node));
+		plist_dict_set_item(request, "Rose,PatchEpoch", plist_copy(node));
+	}
 
 	plist_free(parameters);
 
@@ -3146,15 +3426,48 @@ static plist_t restore_get_veridian_firmware_data(struct idevicerestore_client_t
 	/* add manifest for current build_identity to parameters */
 	tss_parameters_add_from_manifest(parameters, client->restore->build_identity, true);
 
+	plist_dict_set_item(parameters, "ApProductionMode", plist_new_bool(1));
+	if (client->image4supported) {
+		plist_dict_set_item(parameters, "ApSecurityMode", plist_new_bool(1));
+		plist_dict_set_item(parameters, "ApSupportsImg4", plist_new_bool(1));
+	} else {
+		plist_dict_set_item(parameters, "ApSupportsImg4", plist_new_bool(0));
+	}
+
+	plist_dict_set_item(parameters, "ApECID", plist_new_uint(client->ecid));
+	plist_dict_set_item(parameters, "ApSecurityDomain", plist_new_uint(1));
+
+	plist_t node = plist_dict_get_item(client->restore->build_identity, "ApChipID");
+	if (node) {
+		plist_dict_set_item(parameters, "ApChipID", plist_copy(node));
+	}
+	node = plist_dict_get_item(client->restore->build_identity, "ApBoardID");
+	if (node) {
+		plist_dict_set_item(parameters, "ApBoardID", plist_copy(node));
+	}
+	if (client->nonce && client->nonce_size > 0) {
+		plist_dict_set_item(parameters, "ApNonce", plist_new_data((char*)client->nonce, client->nonce_size));
+	}
+
 	/* add BMU,* tags from info dictionary to parameters */
 	plist_dict_merge(&parameters, p_info);
 
 	/* add required tags for Veridian TSS request */
 	tss_request_add_veridian_tags(request, parameters, device_generated_request);
 
+	if (device_generated_request) {
+		logger(LL_DEBUG, "Merging DeviceGeneratedRequest into Veridian TSS request\n");
+		plist_dict_merge(&request, device_generated_request);
+	}
+
+	/* Caveman make sure Veridian request has all tags! Apple very picky! */
+	tss_request_add_caveman_tags(client, request, p_info, client->restore->build_identity, "BMU", client->ecid, client->nonce, client->nonce_size);
+	tss_request_add_caveman_tags(client, request, p_info, client->restore->build_identity, "Veridian", client->ecid, client->nonce, client->nonce_size);
+
 	plist_free(parameters);
 
 	logger(LL_INFO, "Sending Veridian TSS request...\n");
+	logger_dump_plist(LL_DEBUG, request, 1);
 	response = tss_request_send(request, client->tss_url);
 	plist_free(request);
 	if (response == NULL) {
@@ -3163,10 +3476,10 @@ static plist_t restore_get_veridian_firmware_data(struct idevicerestore_client_t
 		return NULL;
 	}
 
-	if (plist_dict_get_item(response, "BMU,Ticket")) {
+	if (plist_dict_get_item(response, "BMU,Ticket") || plist_dict_get_item(response, "Veridian,Ticket")) {
 		logger(LL_INFO, "Received Veridian ticket\n");
 	} else {
-		logger(LL_ERROR, "No 'BMU,Ticket' in TSS response, this might not work\n");
+		logger(LL_ERROR, "No 'BMU,Ticket' or 'Veridian,Ticket' in TSS response, this might not work\n");
 	}
 
 	/* don't add FirmwareData if not requested via ResponseTags */
@@ -3265,6 +3578,9 @@ static plist_t restore_get_generic_firmware_data(struct idevicerestore_client_t*
 	}
 	plist_dict_merge(&request, device_generated_request);
 
+	/* Caveman make sure generic request has all tags! Apple very picky! */
+	tss_request_add_caveman_tags(client, request, p_info, client->restore->build_identity, s_updater_name, client->ecid, client->nonce, client->nonce_size);
+
 	logger(LL_INFO, "Sending %s TSS request...\n", s_updater_name);
 	logger_dump_plist(LL_DEBUG, request, 0);
 	response = tss_request_send(request, client->tss_url);
@@ -3320,11 +3636,43 @@ static plist_t restore_get_tcon_firmware_data(struct idevicerestore_client_t* cl
 	/* add manifest for current build_identity to parameters */
 	tss_parameters_add_from_manifest(parameters, client->restore->build_identity, true);
 
+	plist_dict_set_item(parameters, "ApProductionMode", plist_new_bool(1));
+	if (client->image4supported) {
+		plist_dict_set_item(parameters, "ApSecurityMode", plist_new_bool(1));
+		plist_dict_set_item(parameters, "ApSupportsImg4", plist_new_bool(1));
+	} else {
+		plist_dict_set_item(parameters, "ApSupportsImg4", plist_new_bool(0));
+	}
+
+	plist_dict_set_item(parameters, "ApECID", plist_new_uint(client->ecid));
+	plist_dict_set_item(parameters, "ApSecurityDomain", plist_new_uint(1));
+
+	plist_t node = plist_dict_get_item(client->restore->build_identity, "ApChipID");
+	if (node) {
+		plist_dict_set_item(parameters, "ApChipID", plist_copy(node));
+	}
+	node = plist_dict_get_item(client->restore->build_identity, "ApBoardID");
+	if (node) {
+		plist_dict_set_item(parameters, "ApBoardID", plist_copy(node));
+	}
+	if (client->nonce && client->nonce_size > 0) {
+		plist_dict_set_item(parameters, "ApNonce", plist_new_data((char*)client->nonce, client->nonce_size));
+	}
+
 	/* add Baobab,* tags from info dictionary to parameters */
 	plist_dict_merge(&parameters, p_info);
 
 	/* add required tags for Baobab TSS request */
 	tss_request_add_tcon_tags(request, parameters, device_generated_request);
+
+	if (device_generated_request) {
+		logger(LL_DEBUG, "Merging DeviceGeneratedRequest into Baobab TSS request\n");
+		plist_dict_merge(&request, device_generated_request);
+	}
+
+	/* Caveman make sure Baobab request has all tags! Apple very picky! */
+	tss_request_add_caveman_tags(client, request, p_info, client->restore->build_identity, "Baobab", client->ecid, client->nonce, client->nonce_size);
+	tss_request_add_caveman_tags(client, request, p_info, client->restore->build_identity, "TCon", client->ecid, client->nonce, client->nonce_size);
 
 	plist_free(parameters);
 
@@ -3337,10 +3685,10 @@ static plist_t restore_get_tcon_firmware_data(struct idevicerestore_client_t* cl
 		return NULL;
 	}
 
-	if (plist_dict_get_item(response, "Baobab,Ticket")) {
+	if (plist_dict_get_item(response, "Baobab,Ticket") || plist_dict_get_item(response, "TCon,Ticket")) {
 		logger(LL_INFO, "Received Baobab ticket\n");
 	} else {
-		logger(LL_ERROR, "No 'Baobab,Ticket' in TSS response, this might not work\n");
+		logger(LL_ERROR, "No 'Baobab,Ticket' or 'TCon,Ticket' in TSS response, this might not work\n");
 	}
 
 	/* don't add FirmwareData if not requested via ResponseTags */
@@ -3420,6 +3768,22 @@ static plist_t restore_get_timer_firmware_data(struct idevicerestore_client_t* c
 		plist_dict_set_item(parameters, "ApSupportsImg4", plist_new_bool(0));
 	}
 
+	plist_dict_set_item(parameters, "ApECID", plist_new_uint(client->ecid));
+	plist_dict_set_item(parameters, "ApSecurityDomain", plist_new_uint(1));
+
+	plist_t node = NULL;
+	node = plist_dict_get_item(client->restore->build_identity, "ApChipID");
+	if (node) {
+		plist_dict_set_item(parameters, "ApChipID", plist_copy(node));
+	}
+	node = plist_dict_get_item(client->restore->build_identity, "ApBoardID");
+	if (node) {
+		plist_dict_set_item(parameters, "ApBoardID", plist_copy(node));
+	}
+	if (client->nonce && client->nonce_size > 0) {
+		plist_dict_set_item(parameters, "ApNonce", plist_new_data((char*)client->nonce, client->nonce_size));
+	}
+
 	/* add Timer,* tags from info dictionary to parameters */
 	plist_t info_array = plist_dict_get_item(p_info, "InfoArray");
 	if (!info_array) {
@@ -3471,6 +3835,64 @@ static plist_t restore_get_timer_firmware_data(struct idevicerestore_client_t* c
 
 	/* add required tags for Timer TSS request */
 	tss_request_add_timer_tags(request, parameters, device_generated_request);
+
+	if (device_generated_request) {
+		logger(LL_DEBUG, "Merging DeviceGeneratedRequest into Timer TSS request\n");
+		plist_dict_merge(&request, device_generated_request);
+	}
+
+	/* Caveman make sure Timer request has all tags! Apple very picky! */
+	tss_request_add_caveman_tags(client, request, ap_info, client->restore->build_identity, NULL, client->ecid, client->nonce, client->nonce_size);
+
+	char key[64];
+	plist_t info_array_tmp = plist_dict_get_item(p_info, "InfoArray");
+	plist_t info_dict = info_array_tmp ? plist_array_get_item(info_array_tmp, 0) : NULL;
+	plist_t hwid = info_dict ? plist_dict_get_item(info_dict, "HardwareID") : NULL;
+
+	snprintf(key, sizeof(key), "Timer,ECID,%u", tag);
+	node = hwid ? plist_dict_get_item(hwid, "ECID") : NULL;
+	if (node) {
+		plist_dict_set_item(request, key, plist_copy(node));
+	} else {
+		plist_dict_set_item(request, key, plist_new_uint(client->ecid));
+	}
+	snprintf(key, sizeof(key), "Timer,ProductionMode,%u", tag);
+	node = hwid ? plist_dict_get_item(hwid, "ProductionStatus") : NULL;
+	if (node) {
+		plist_dict_set_item(request, key, plist_copy(node));
+	} else {
+		plist_dict_set_item(request, key, plist_new_bool(1));
+	}
+	snprintf(key, sizeof(key), "Timer,SecurityMode,%u", tag);
+	node = hwid ? plist_dict_get_item(hwid, "SecurityMode") : NULL;
+	if (node) {
+		plist_dict_set_item(request, key, plist_copy(node));
+	} else {
+		plist_dict_set_item(request, key, plist_new_bool(1));
+	}
+	snprintf(key, sizeof(key), "Timer,SupportsImg4,%u", tag);
+	plist_dict_set_item(request, key, plist_new_bool(1));
+
+	node = hwid ? plist_dict_get_item(hwid, "ChipID") : NULL;
+	if (!node) node = plist_dict_get_item(client->restore->build_identity, "ApChipID");
+	if (node) {
+		snprintf(key, sizeof(key), "Timer,ChipID,%u", tag);
+		plist_dict_set_item(request, key, plist_copy(node));
+	}
+	node = hwid ? plist_dict_get_item(hwid, "BoardID") : NULL;
+	if (!node) node = plist_dict_get_item(client->restore->build_identity, "ApBoardID");
+	if (node) {
+		snprintf(key, sizeof(key), "Timer,BoardID,%u", tag);
+		plist_dict_set_item(request, key, plist_copy(node));
+	}
+	node = hwid ? plist_dict_get_item(hwid, "Nonce") : NULL;
+	if (node) {
+		snprintf(key, sizeof(key), "Timer,Nonce,%u", tag);
+		plist_dict_set_item(request, key, plist_copy(node));
+	} else if (client->nonce && client->nonce_size > 0) {
+		snprintf(key, sizeof(key), "Timer,Nonce,%u", tag);
+		plist_dict_set_item(request, key, plist_new_data((char*)client->nonce, client->nonce_size));
+	}
 
 	plist_free(parameters);
 
@@ -3637,11 +4059,23 @@ static plist_t restore_get_cryptex1_firmware_data(struct idevicerestore_client_t
 	if (!plist_dict_get_item(parameters, "ApSecurityMode")) {
 		plist_dict_set_item(parameters, "ApSecurityMode", plist_new_bool(1));
 	}
+	if (!plist_dict_get_item(parameters, "ApSupportsImg4")) {
+		plist_dict_set_item(parameters, "ApSupportsImg4", plist_new_bool(client->image4supported));
+	}
 	if (!plist_dict_get_item(parameters, "ApChipID")) {
 		plist_dict_copy_uint(parameters, client->restore->build_identity, "ApChipID", NULL);
 	}
 	if (!plist_dict_get_item(parameters, "ApBoardID")) {
 		plist_dict_copy_uint(parameters, client->restore->build_identity, "ApBoardID", NULL);
+	}
+	if (!plist_dict_get_item(parameters, "ApECID")) {
+		plist_dict_set_item(parameters, "ApECID", plist_new_uint(client->ecid));
+	}
+	if (!plist_dict_get_item(parameters, "ApSecurityDomain")) {
+		plist_dict_set_item(parameters, "ApSecurityDomain", plist_new_uint(1));
+	}
+	if (!plist_dict_get_item(parameters, "ApNonce") && client->nonce && client->nonce_size > 0) {
+		plist_dict_set_item(parameters, "ApNonce", plist_new_data((char*)client->nonce, client->nonce_size));
 	}
 
 	/* add device generated request data to parameters */
@@ -3655,6 +4089,9 @@ static plist_t restore_get_cryptex1_firmware_data(struct idevicerestore_client_t
 
 	/* add Cryptex1 tags to request */
 	tss_request_add_cryptex_tags(request, parameters, NULL);
+
+	/* Caveman make sure Cryptex1 request has all tags! Apple very picky! */
+	tss_request_add_caveman_tags(client, request, NULL, client->restore->build_identity, NULL, client->ecid, client->nonce, client->nonce_size);
 
 	plist_free(parameters);
 
@@ -3767,7 +4204,8 @@ static int restore_send_firmware_updater_data(struct idevicerestore_client_t* cl
 	}
 
 	plist_get_string_val(p_updater_name, &s_updater_name);
-	logger_dump_plist(LL_DEBUG, p_info, 1);
+	logger(LL_DEBUG, "%s: MessageArg for %s:\n", __func__, s_updater_name);
+	logger_dump_plist(LL_DEBUG, arguments, 1);
 
 	if (strcmp(s_updater_name, "SE") == 0) {
 		fwdict = restore_get_se_firmware_data(client, p_info, arguments);
